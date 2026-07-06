@@ -74,7 +74,8 @@ flowchart TD
 13. [Phase 11 — Android Status Widget](#phase-11--android-status-widget)
 14. [Phase 12 — Resilient HDD Mount (Emergency Mode Fix)](#phase-12--resilient-hdd-mount-emergency-mode-fix)
 15. [Phase 13 — Docker Boot Race Condition Fix](#phase-13--docker-boot-race-condition-fix)
-16. [Troubleshooting](#troubleshooting)
+16. [Phase 14 — Remote Commands Screen (Phone App)](#phase-14--remote-commands-screen-phone-app)
+17. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -1001,16 +1002,312 @@ Verify the volume path inside the container. The compose file maps `/mnt/externa
 
 ---
 
+## Phase 14 — Remote Commands Screen (Phone App)
+
+An extension of the Android app that adds a **Commands** tab alongside the status widget. From your phone you can run live diagnostics (`docker ps`, `df -h`, `free -h`) and trigger host-level operations (restart Docker daemon, reboot Jarvis) — all over the same authenticated Cloudflare tunnel, from anywhere in the world.
+
+### Architecture
+
+```mermaid
+flowchart LR
+    Phone(["📱 Phone App"])
+
+    subgraph StatusServer["status-server (Docker container)"]
+        API["/api/command"]
+        ContainerCmds["Container-level commands\ndocker ps, df -h, free -h\ndocker restart &lt;name&gt;"]
+    end
+
+    subgraph Host["Jarvis Host (systemd)"]
+        Agent["host-agent\nNode.js :7070"]
+        HostCmds["Host-level commands\nsystemctl restart docker\nreboot"]
+    end
+
+    Phone -->|"POST /api/command\n?secret=xxx"| API
+    API -->|"runs inside container\nvia child_process"| ContainerCmds
+    API -->|"POST 172.18.0.1:7070/run\nx-agent-secret header\n(docker_gwbridge)"| Agent
+    Agent --> HostCmds
+```
+
+**Why two layers?** The status server runs inside a Docker container and can execute most commands directly. But some operations — like restarting the Docker daemon itself or rebooting the host — are impossible from inside a container. The host agent runs as a systemd service directly on Jarvis and handles only those privileged operations, reachable from containers via the `docker_gwbridge` interface at `172.18.0.1`.
+
+### What didn't work (and why)
+
+Many obvious approaches fail here. This table is useful to understand the constraints:
+
+| Approach                                                        | Why it failed                                        |
+| --------------------------------------------------------------- | ---------------------------------------------------- |
+| `nsenter -t 1` inside container                                 | Container not privileged enough                      |
+| `systemctl` inside container                                    | Alpine Linux has no systemd                          |
+| Docker socket to restart Docker daemon                          | Can't restart the daemon managing your own container |
+| Agent bound to `127.0.0.1`                                      | Loopback — not reachable from inside containers      |
+| Agent IP `10.0.1.1` (Swarm gateway)                             | Virtual IP, not assigned to any real interface       |
+| Host-network Docker container for agent                         | Still couldn't bridge the gap                        |
+| **`172.18.0.1` (docker_gwbridge) + systemd agent on `0.0.0.0`** | ✅ **This is the solution**                          |
+
+The `docker_gwbridge` interface is the one real host IP that Docker containers can reliably reach. Binding the agent to `0.0.0.0` on the host and calling it at `172.18.0.1:7070` from inside a container is the correct pattern for host-level privileged operations.
+
+Find your own `docker_gwbridge` IP with:
+
+```bash
+ip addr show | grep "172.18"
+# docker_gwbridge: 172.18.0.1
+```
+
+---
+
+### Part 1 — Host Agent
+
+A minimal Node.js HTTP server that runs as a systemd service on the host. It accepts only a fixed allowlist of commands and responds before executing, so the client gets an acknowledgement even if Docker restarts mid-request.
+
+#### 1.1 Create the agent
+
+```bash
+mkdir -p /opt/host-agent && cd /opt/host-agent
+npm init -y
+nano agent.js
+```
+
+```js
+const http = require("http");
+const { exec } = require("child_process");
+
+const PORT = 7070;
+const SECRET = process.env.AGENT_SECRET;
+
+const ALLOWED = {
+  // Restarts the Docker daemon by stopping and restarting all containers
+  // (true daemon restart isn't possible from inside Docker)
+  "docker-daemon-restart": "docker restart $(docker ps -q)",
+  reboot: "reboot",
+};
+
+http
+  .createServer((req, res) => {
+    if (req.method !== "POST" || req.url !== "/run") {
+      return res.writeHead(404).end();
+    }
+
+    const secret = req.headers["x-agent-secret"];
+    if (secret !== SECRET) {
+      return res.writeHead(403).end(JSON.stringify({ error: "Unauthorized" }));
+    }
+
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      const { commandKey } = JSON.parse(body);
+      const command = ALLOWED[commandKey];
+
+      if (!command) {
+        res.writeHead(400).end(JSON.stringify({ error: "Unknown command" }));
+        return;
+      }
+
+      console.log(`[AGENT] Running: ${command}`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({ success: true, output: `Executing: ${command}` }),
+      );
+
+      // Send response first, THEN execute — so client gets the ack before Docker dies
+      setTimeout(() => exec(command), 500);
+    });
+  })
+  .listen(PORT, "0.0.0.0", () => {
+    console.log(`Host agent listening on 127.0.0.1:${PORT}`);
+  });
+```
+
+#### 1.2 Register as a systemd service
+
+```bash
+sudo nano /etc/systemd/system/host-agent.service
+```
+
+```ini
+[Unit]
+Description=Home Server Host Agent
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/node /opt/host-agent/agent.js
+Restart=always
+Environment=AGENT_SECRET=your_secret_here
+User=root
+WorkingDirectory=/opt/host-agent
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable host-agent
+sudo systemctl start host-agent
+```
+
+---
+
+### Part 2 — Status Server additions
+
+The existing status server gains a `/api/command` route that dispatches commands to either the container runtime or the host agent depending on the command type.
+
+#### 2.1 Add to `.env`
+
+```env
+AGENT_SECRET=your_secret_here    # Must match host-agent.service Environment value
+```
+
+#### 2.2 Add to top of `index.js`
+
+```js
+const { exec } = require("child_process");
+const util = require("util");
+const execAsync = util.promisify(exec);
+
+// Commands that run inside the container (Docker socket)
+const ALLOWED_COMMANDS = {
+  "docker-ps": "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'",
+  "docker-ps-all":
+    "docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'",
+  "docker-stats":
+    "docker stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}'",
+  "docker-images":
+    "docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'",
+  "disk-usage": "df -h",
+  "memory-usage": "free -h",
+};
+
+// Commands that must run on the HOST via the agent
+const HOST_COMMANDS = new Set(["docker-daemon-restart", "reboot"]);
+```
+
+#### 2.3 Add the `/api/command` route
+
+```js
+app.post("/api/command", requireSecret, express.json(), async (req, res) => {
+  const { commandKey } = req.body;
+
+  if (!commandKey) {
+    return res.status(400).json({ error: "Missing commandKey" });
+  }
+
+  // ── Route to host agent ──────────────────────────────────────────────────
+  if (HOST_COMMANDS.has(commandKey)) {
+    try {
+      const agentRes = await axios.post(
+        AGENT_URL,
+        { commandKey },
+        {
+          headers: {
+            "x-agent-secret": AGENT_SECRET,
+            "Content-Type": "application/json",
+          },
+          timeout: 5000,
+        },
+      );
+      return res.json(agentRes.data);
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        output: `Host agent unreachable: ${err.message}`,
+      });
+    }
+  }
+
+  // ── Run inside container ─────────────────────────────────────────────────
+  if (!ALLOWED_COMMANDS[commandKey]) {
+    return res.status(400).json({
+      error: "Invalid command",
+      allowed: [...Object.keys(ALLOWED_COMMANDS), ...HOST_COMMANDS],
+    });
+  }
+
+  const command = ALLOWED_COMMANDS[commandKey];
+  console.log(`[COMMAND] Executing: ${command}`);
+
+  try {
+    const { stdout, stderr } = await execAsync(command, { timeout: 15000 });
+    res.json({
+      success: true,
+      command,
+      output: stdout || stderr || "(no output)",
+    });
+  } catch (err) {
+    res.json({
+      success: false,
+      command,
+      output: err.stderr || err.message,
+    });
+  }
+});
+```
+
+---
+
+### Part 3 — Phone App
+
+The app gains a **Commands** tab alongside the existing Status tab.
+
+#### `theme.ts` — shared design constants
+
+```ts
+export const C = {
+  bg: "#0f172a",
+  surface: "#1e293b",
+  surfaceElevated: "#243044",
+  border: "#334155",
+  divider: "#1e2d3d",
+  text: "#f1f5f9",
+  muted: "#94a3b8",
+  cyan: "#22d3ee",
+  green: "#4ade80",
+  amber: "#fbbf24",
+  rose: "#fb7185",
+};
+export const SPACE = { xs: 4, sm: 8, md: 12, lg: 16, xl: 20 };
+export const RADIUS = { card: 14, pill: 20 };
+```
+
+#### `api.ts` — add `sendCommand`
+
+```ts
+export async function sendCommand(commandKey: string) {
+  const BASE_URL = STATUS_URL.replace("/api/status", "");
+  const { signal, clear } = makeTimeout(20_000);
+  try {
+    const res = await fetch(`${BASE_URL}/api/command?secret=${STATUS_SECRET}`, {
+      method: "POST",
+      signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commandKey }),
+    });
+    clear();
+    return await res.json();
+  } catch (err: any) {
+    clear();
+    return { success: false, output: err.message ?? "Request failed" };
+  }
+}
+```
+
+#### `App.tsx` — tab bar
+
+Add a bottom tab navigator that switches between the existing `StatusScreen` and the new `CommandsScreen`.
+
+---
+
 ## Stack Summary
 
-| Service           | Image / Type                       | Internal Port | Public URL           |
-| ----------------- | ---------------------------------- | ------------- | -------------------- |
-| Dokploy           | `dokploy/dokploy`                  | 3000          | `panel.johndoe.dev`  |
-| Portfolio         | Custom (GitHub)                    | 3000          | `johndoe.dev`        |
-| Immich            | `ghcr.io/immich-app/immich-server` | 2283          | `photos.johndoe.dev` |
-| Jellyfin          | `jellyfin/jellyfin`                | 8096          | `stream.johndoe.dev` |
-| app Frontend      | Custom (GitHub)                    | 3000          | `app.johndoe.dev`    |
-| app Backend       | Custom (GitHub)                    | 8000          | _(internal only)_    |
-| MongoDB           | `mongo`                            | 27017         | _(internal only)_    |
-| Status Server     | Custom (GitHub, Node.js)           | 3001          | `status.johndoe.dev` |
-| Cloudflare Tunnel | `cloudflared`                      | —             | _(agent only)_       |
+| Service           | Image / Type                       | Internal Port | Public URL                  |
+| ----------------- | ---------------------------------- | ------------- | --------------------------- |
+| Dokploy           | `dokploy/dokploy`                  | 3000          | `panel.johndoe.dev`         |
+| Portfolio         | Custom (GitHub)                    | 3000          | `johndoe.dev`               |
+| Immich            | `ghcr.io/immich-app/immich-server` | 2283          | `photos.johndoe.dev`        |
+| Jellyfin          | `jellyfin/jellyfin`                | 8096          | `stream.johndoe.dev`        |
+| app Frontend      | Custom (GitHub)                    | 3000          | `app.johndoe.dev`           |
+| app Backend       | Custom (GitHub)                    | 8000          | _(internal only)_           |
+| MongoDB           | `mongo`                            | 27017         | _(internal only)_           |
+| Status Server     | Custom (GitHub, Node.js)           | 3001          | `status.johndoe.dev`        |
+| Host Agent        | systemd service (Node.js)          | 7070          | _(host only, `172.18.0.1`)_ |
+| Cloudflare Tunnel | `cloudflared`                      | —             | _(agent only)_              |

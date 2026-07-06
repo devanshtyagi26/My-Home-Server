@@ -843,9 +843,64 @@ SECRET_KEY=a_long_random_secret_for_the_widget
 
 Offline services sort to the top so the widget can render them prominently without any extra client-side logic.
 
-### Android Widget
+### Android App & Widget
 
-The widget calls `/api/status` (with the secret key stored in the app) every 4 minutes via a background task handler. It renders each service as a labeled row with a colored status indicator. If `/health` returns a network error, the entire widget switches to a "Server Offline" state rather than showing stale per-service data.
+The mobile client is built with **Expo + React Native** and ships two surfaces: a full in-app status dashboard with a **Status** tab and a **Commands** tab (see Phase 14), and a native Android home screen widget that updates in the background every 4 minutes.
+
+#### App structure
+
+| File                                 | Purpose                                                      |
+| ------------------------------------ | ------------------------------------------------------------ |
+| `api.ts`                             | Network layer — health check, status fetch, command dispatch |
+| `App.tsx`                            | Root screen with tab bar (Status / Commands)                 |
+| `widgets/HomeServerHealthWidget.tsx` | React Native Android widget component                        |
+| `page/CommandScreen.tsx`             | Commands tab UI                                              |
+| `theme.ts`                           | Shared design tokens (colours, spacing, radii)               |
+| `background-task.ts`                 | Registers the `expo-background-fetch` task                   |
+
+#### `api.ts` — two-stage fetch with server-down detection
+
+Before requesting service statuses, `fetchServerData()` calls the unauthenticated `/health` endpoint first. If that times out (4 s), the function short-circuits and returns a `serverDown: true` payload without hitting `/api/status` at all — so the widget shows "Unreachable" rather than stale data or a misleading partial result.
+
+```
+fetchServerData()
+  ├── GET /health  (4s timeout, no auth)
+  │    └── unreachable → return { serverDown: true }
+  └── GET /api/status?secret=xxx  (10s timeout)
+       ├── strip _meta keys
+       ├── normalise each value → "ONLINE" | "OFFLINE" | "UNKNOWN"
+       └── return ServerData { services, onlineCount, totalCount, ... }
+```
+
+`sendCommand()` shares the same base URL, using a 20 s timeout to accommodate slow operations like Docker daemon restarts.
+
+Environment variables expected in `.env`:
+
+```env
+EXPO_PUBLIC_STATUS_URL=https://status.johndoe.dev/api/status
+EXPO_PUBLIC_STATUS_SECRET=your_widget_secret_here
+EXPO_PUBLIC_SERVER_NAME=Jarvis
+```
+
+#### `HomeServerHealthWidget.tsx` — home screen widget
+
+Built with `react-native-android-widget`. Design decisions worth noting:
+
+- **Offline-first sort** — services are ranked `OFFLINE → UNKNOWN → ONLINE` before rendering, so the things that need attention are always visible even when the list is truncated to the widget's 8-item cap.
+- **Uptime bar** — a slim 4 px proportional bar below the header gives an immediate at-a-glance read on the online ratio before the service list is even scanned.
+- **Stale badge** — if `minutesSinceCheck > 15`, a yellow `STALE` label appears in the footer so you know the data is old rather than assuming the server is healthy.
+- **Server-down vs. service-down** — the header colour and summary text distinguish between "the status server itself is unreachable" (amber, "Unreachable") and "server is up but services are degraded" (rose, "N services need attention").
+- **`clickAction="REFRESH"`** on the footer button wires back to the widget task handler, which re-runs the health check and calls `requestWidgetUpdate` to re-render.
+
+#### `App.tsx` — in-app dashboard
+
+The app mirrors the widget's visual language (same colour tokens from `theme.ts`) so both surfaces feel like one product. The root screen renders:
+
+1. A header with server name and the same online/offline badge as the widget
+2. A tab bar switching between **Status** (live service list) and **Commands** (Phase 14)
+3. A **Refresh Now** button that re-fetches and also pushes the fresh data to the home screen widget via `requestWidgetUpdate`
+
+Background polling is registered via `expo-background-fetch` on first mount so the widget stays current even when the app is closed.
 
 ---
 
@@ -1165,7 +1220,10 @@ const { exec } = require("child_process");
 const util = require("util");
 const execAsync = util.promisify(exec);
 
-// Commands that run inside the container (Docker socket)
+const AGENT_URL = "http://172.18.0.1:7070/run"; // docker_gwbridge IP
+const AGENT_SECRET = process.env.AGENT_SECRET;
+
+// Executed inside the container via child_process
 const ALLOWED_COMMANDS = {
   "docker-ps": "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'",
   "docker-ps-all":

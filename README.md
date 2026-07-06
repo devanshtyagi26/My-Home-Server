@@ -72,7 +72,9 @@ flowchart TD
 11. [Reliability & Boot Configuration](#reliability--boot-configuration)
 12. [Phase 10 — Secure Remote SSH via Cloudflare Tunnel](#phase-10--secure-remote-ssh-via-cloudflare-tunnel)
 13. [Phase 11 — Android Status Widget](#phase-11--android-status-widget)
-14. [Troubleshooting](#troubleshooting)
+14. [Phase 12 — Resilient HDD Mount (Emergency Mode Fix)](#phase-12--resilient-hdd-mount-emergency-mode-fix)
+15. [Phase 13 — Docker Boot Race Condition Fix](#phase-13--docker-boot-race-condition-fix)
+16. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -843,6 +845,128 @@ Offline services sort to the top so the widget can render them prominently witho
 ### Android Widget
 
 The widget calls `/api/status` (with the secret key stored in the app) every 4 minutes via a background task handler. It renders each service as a labeled row with a colored status indicator. If `/health` returns a network error, the entire widget switches to a "Server Offline" state rather than showing stale per-service data.
+
+---
+
+## Phase 12 — Resilient HDD Mount (Emergency Mode Fix)
+
+By default, Linux treats your external drive as a critical system dependency. If the cable is loose or the drive isn't detected during startup, the kernel panics and drops Jarvis into Emergency Mode — taking down every service with it.
+
+Two `fstab` flags fix this permanently:
+
+- **`nofail`** — If the drive isn't present at boot, skip it and finish starting up normally. No Emergency Mode.
+- **`x-systemd.automount`** — Don't try to mount the drive eagerly at boot. Instead, wait until a process (Immich, Jellyfin, a container) actually tries to read `/mnt/external-media`, then mount on the fly.
+
+Together they create a self-healing setup: if the cable gets jiggled loose and reconnected, systemd remounts the drive automatically the moment any container next requests a file — no manual terminal rescue required.
+
+### 12.1 Update `/etc/fstab`
+
+```bash
+sudo nano /etc/fstab
+```
+
+Find your external media line at the bottom. It currently looks something like this:
+
+```
+UUID=<your-uuid-here>  /mnt/external-media  ext4  defaults,noatime  0  2
+```
+
+Append `,nofail,x-systemd.automount` to the options column (no spaces inside the comma-separated list):
+
+```
+UUID=<your-uuid-here>  /mnt/external-media  ext4  defaults,noatime,nofail,x-systemd.automount  0  2
+```
+
+Save and exit (`Ctrl+O`, `Enter`, `Ctrl+X`).
+
+### 12.2 Reload systemd
+
+```bash
+# Unmount the drive if it's currently locked in manually
+sudo umount /mnt/external-media
+
+# Tell systemd to process the fresh automount directives
+sudo systemctl daemon-reload
+sudo systemctl restart local-fs.target
+```
+
+### 12.3 Test the Automount
+
+Run `lsblk` — even with the drive physically connected, the `MOUNTPOINT` column may show blank. That's expected: automount waits for a real access request.
+
+```bash
+lsblk
+```
+
+Now trigger a mount by listing the directory:
+
+```bash
+ls /mnt/external-media
+```
+
+The terminal will pause for a fraction of a second while systemd wakes the USB hardware channel and hooks the filesystem path, then your files appear. Run `lsblk` again and `/mnt/external-media` will have snapped back into place.
+
+**What this changes going forward:**
+
+| Scenario                           | Before                  | After                                |
+| ---------------------------------- | ----------------------- | ------------------------------------ |
+| Boot with cable unplugged          | Emergency Mode 🔴       | Normal boot, drive skipped ✅        |
+| Boot with cable plugged in         | Normal boot ✅          | Normal boot, drive lazy-mounted ✅   |
+| Cable drops at runtime, reconnects | Manual `mount` required | Auto-remounts on next file access ✅ |
+
+---
+
+## Phase 13 — Docker Boot Race Condition Fix
+
+When Jarvis restarts, Docker often fires up faster than the USB hardware controller finishes initializing. Containers like Immich and Jellyfin look at `/mnt/external-media` immediately on start, find an empty folder (the drive hasn't mounted yet), and fail silently or misbehave.
+
+Forcing Docker to restart ~30 seconds after boot solves this race condition.
+
+### 13.1 The Problem with a Naive Cron Job
+
+A plain `@reboot sleep 15 && systemctl restart docker` fails silently in cron. The reason: cron runs in a stripped environment with almost no `$PATH`. When it tries to run `sleep` or `systemctl`, it has no idea where those binaries live and exits with a silent "command not found" error.
+
+The fix is to use absolute binary paths and add logging so you can diagnose any future issues.
+
+### 13.2 Harden the Root Crontab
+
+```bash
+sudo crontab -e
+```
+
+Remove any existing reboot line and replace it with:
+
+```
+@reboot /bin/sleep 30 && /bin/systemctl restart docker >> /var/log/docker_reboot.log 2>&1
+```
+
+What each part does:
+
+| Part                                 | Purpose                                                           |
+| ------------------------------------ | ----------------------------------------------------------------- |
+| `/bin/sleep 30`                      | Explicit path — cron-safe. 30s gives USB hardware time to settle. |
+| `/bin/systemctl restart docker`      | Explicit path — cron-safe. Restarts Docker after the delay.       |
+| `>> /var/log/docker_reboot.log 2>&1` | Logs all output (success or error) for diagnosis.                 |
+
+Save and exit (`Ctrl+O`, `Enter`, `Ctrl+X`).
+
+### 13.3 Verify After Next Reboot
+
+After restarting Jarvis (`sudo reboot`), wait ~45 seconds, then SSH back in and check the log:
+
+```bash
+cat /var/log/docker_reboot.log
+```
+
+- **Empty/blank** — the command ran cleanly and restarted Docker without complaint.
+- **Any output** — the log will show exactly what systemd complained about.
+
+Cross-check with container uptime to confirm the restart fired:
+
+```bash
+docker ps
+# Immich and Jellyfin should show "Up Less than a minute" or similar fresh uptime
+```
 
 ---
 

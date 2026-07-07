@@ -902,6 +902,79 @@ The app mirrors the widget's visual language (same colour tokens from `theme.ts`
 
 Background polling is registered via `expo-background-fetch` on first mount so the widget stays current even when the app is closed.
 
+#### Fingerprint auth for danger commands
+
+Destructive commands (Docker daemon restart, server reboot) require biometric confirmation before they fire. This replaces a modal confirm dialog — it's faster for the user and meaningfully harder to trigger by accident.
+
+Install the package:
+
+```bash
+npx expo install expo-local-authentication
+npx expo prebuild
+```
+
+In `CommandsScreen.tsx`, add the auth gate and swap it in on the `onPress` handler for any command flagged `danger: true`:
+
+```ts
+import * as LocalAuthentication from 'expo-local-authentication';
+
+async function authenticateAndRun(cmd: typeof COMMANDS[0]) {
+  const result = await LocalAuthentication.authenticateAsync({
+    promptMessage: `Confirm: ${cmd.label}`,
+    fallbackLabel: 'Use passcode',
+  });
+
+  if (result.success) {
+    run(cmd);
+  }
+}
+
+// In your JSX — replace the danger branch of onPress:
+onPress={() => cmd.danger ? authenticateAndRun(cmd) : run(cmd)}
+```
+
+The confirm modal can be removed entirely — the OS biometric prompt is a stricter gate than a tap-to-confirm dialog and requires no additional UI to maintain.
+
+#### Auto-restart Docker when server is unreachable
+
+When `isServerReachable()` returns false, `fetchServerData()` fires a `docker-daemon-restart` command to the host agent as a best-effort recovery before returning the server-down payload.
+
+The key design point: the host agent (`172.18.0.1:7070`) runs as a systemd service directly on Jarvis and is reachable independently of the Docker network. So even when the status server container is dead, the restart command can still get through.
+
+```ts
+async function triggerDockerRestart() {
+  try {
+    const BASE_URL = STATUS_URL.replace("/api/status", "");
+    await fetch(`${BASE_URL}/api/command?secret=${STATUS_SECRET}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commandKey: "docker-daemon-restart" }),
+    });
+  } catch {
+    // silent — best effort only
+  }
+}
+
+export async function fetchServerData(): Promise<ServerData> {
+  const reachable = await isServerReachable();
+  if (!reachable) {
+    triggerDockerRestart(); // fire-and-forget — no await
+    return {
+      serverName,
+      services: { "status server": "OFFLINE" },
+      allOnline: false,
+      onlineCount: 0,
+      totalCount: 1,
+      lastChecked,
+      serverDown: true,
+    };
+  }
+  // ... rest unchanged
+}
+```
+
+No `await` on `triggerDockerRestart()` — the function returns the server-down state immediately to update the UI, while the restart attempt runs in the background. The next background fetch (4 minutes later) will reflect whether Docker came back up.
+
 ---
 
 ## Phase 12 — Resilient HDD Mount (Emergency Mode Fix)
